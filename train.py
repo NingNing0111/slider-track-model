@@ -19,8 +19,9 @@ from model.wgan import Generator, Discriminator
 LATENT_DIM = 64
 LAMBDA_GP = 10.0        # WGAN-GP 梯度惩罚
 LAMBDA_GEOM = 2.0       # 几何约束（终点距离），降低避免主导
-LAMBDA_SMOOTH = 5.0     # 平滑约束（惩罚 jerk），防止尖刺
+LAMBDA_SMOOTH = 1.0     # 平滑约束（惩罚 jerk），过大会压制抖动
 LAMBDA_SPREAD = 3.0     # 分散约束：防止位移集中在少数步
+LAMBDA_JITTER = 0.5     # 最小抖动约束：鼓励 dx 有人手般的自然波动
 D_STEPS = 3             # D/G 训练比（减少以获得更多 G 更新）
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -84,6 +85,18 @@ def spread_loss(fake_seq):
     return concentration + backward
 
 
+def jitter_loss(fake_seq, min_std=0.04):
+    """
+    最小抖动约束：鼓励 dx 沿时间有自然波动，避免过于平滑。
+    人工轨迹的 dx 有明显方差（手部微抖），模型不应输出完美平滑序列。
+    fake_seq: (B, L, 2)
+    min_std: 归一化空间中 dx 的最小标准差
+    """
+    dx = fake_seq[:, :, 0]                                      # (B, L)
+    std_per_sample = dx.std(dim=1).clamp(min=1e-8)              # (B,)
+    return (min_std - std_per_sample).clamp(min=0).mean()
+
+
 # ============================
 # 训练主循环
 # ============================
@@ -99,6 +112,7 @@ def train():
     parser.add_argument("--lambda-geom", type=float, default=LAMBDA_GEOM)
     parser.add_argument("--lambda-smooth", type=float, default=LAMBDA_SMOOTH)
     parser.add_argument("--lambda-spread", type=float, default=LAMBDA_SPREAD)
+    parser.add_argument("--lambda-jitter", type=float, default=LAMBDA_JITTER)
     args = parser.parse_args()
 
     # ---- 数据加载 ----
@@ -115,7 +129,7 @@ def train():
     print(f"超参: epochs={args.epochs}, batch_size={args.batch_size}, lr={args.lr}, d_steps={args.d_steps}")
     print(
         f"  λ_gp={args.lambda_gp}, λ_geom={args.lambda_geom}, "
-        f"λ_smooth={args.lambda_smooth}, λ_spread={args.lambda_spread}"
+        f"λ_smooth={args.lambda_smooth}, λ_spread={args.lambda_spread}, λ_jitter={args.lambda_jitter}"
     )
 
     # ---- 模型 ----
@@ -131,7 +145,7 @@ def train():
         G.train()
         D.train()
         d_loss_sum, g_loss_sum = 0.0, 0.0
-        geom_sum, smooth_sum, spread_sum = 0.0, 0.0, 0.0
+        geom_sum, smooth_sum, spread_sum, jitter_sum = 0.0, 0.0, 0.0, 0.0
         n_d_steps, n_g_steps = 0, 0
 
         for step, (cond_np, seq_np) in enumerate(
@@ -165,11 +179,13 @@ def train():
                 loss_geom = geometry_loss(gen_seq, cond)
                 loss_smooth = smoothness_loss(gen_seq)
                 loss_spread = spread_loss(gen_seq)
+                loss_jitter = jitter_loss(gen_seq)
 
                 g_loss = (loss_adv
                           + args.lambda_geom * loss_geom
                           + args.lambda_smooth * loss_smooth
-                          + args.lambda_spread * loss_spread)
+                          + args.lambda_spread * loss_spread
+                          + args.lambda_jitter * loss_jitter)
 
                 g_opt.zero_grad()
                 g_loss.backward()
@@ -179,6 +195,7 @@ def train():
                 geom_sum += loss_geom.item()
                 smooth_sum += loss_smooth.item()
                 spread_sum += loss_spread.item()
+                jitter_sum += loss_jitter.item()
                 n_g_steps += 1
 
         # ---- 日志 ----
@@ -188,10 +205,12 @@ def train():
             geom_avg = geom_sum / max(n_g_steps, 1)
             smooth_avg = smooth_sum / max(n_g_steps, 1)
             spread_avg = spread_sum / max(n_g_steps, 1)
+            jitter_avg = jitter_sum / max(n_g_steps, 1)
             print(
                 f"Epoch {epoch+1}/{args.epochs}  "
                 f"D={d_avg:.4f}  G={g_avg:.4f}  "
-                f"Geom={geom_avg:.4f}  Smooth={smooth_avg:.6f}  Spread={spread_avg:.4f}"
+                f"Geom={geom_avg:.4f}  Smooth={smooth_avg:.6f}  "
+                f"Spread={spread_avg:.4f}  Jitter={jitter_avg:.4f}"
             )
 
         # ---- 定期保存 ----
