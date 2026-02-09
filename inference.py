@@ -56,6 +56,9 @@ def generate_trajectory(
     add_jitter=True,
     jitter_std_px=0.8,
     jitter_alpha=0.85,
+    clip_dx_min_px=-2.0,
+    clip_dx_max_px=None,
+    force_monotone_x=False,
 ):
     """
     给定目标距离（像素），生成一条轨迹 points: [{x, y, t}, ...]。
@@ -85,6 +88,12 @@ def generate_trajectory(
         dx = dx + _colored_noise(len(dx), std=jitter_std_px, alpha=jitter_alpha)
         dy = dy + _colored_noise(len(dy), std=jitter_std_px * 0.5, alpha=jitter_alpha)
 
+    # ---- 约束：限制每步回退与尖峰（在终点缩放前做，避免缩放放大回撤）----
+    if clip_dx_min_px is not None:
+        dx = np.maximum(dx, float(clip_dx_min_px))
+    if clip_dx_max_px is not None:
+        dx = np.minimum(dx, float(clip_dx_max_px))
+
     # 累加位移
     x = np.cumsum(np.concatenate([[0], dx]))
     total_x = x[-1]
@@ -98,6 +107,14 @@ def generate_trajectory(
 
     x = np.cumsum(np.concatenate([[0], dx]))
     y = np.cumsum(np.concatenate([[0], dy]))
+
+    # 可选：强制单调（彻底消除回撤），再做一次终点对齐
+    if force_monotone_x:
+        x = np.maximum.accumulate(x)
+        end = float(x[-1])
+        if end > 1e-9:
+            x = x * (float(target_distance) / end)
+        dx = np.diff(x)
 
     # ---- 时间重建：等间隔 + 小抖动，缩放到人工典型总时长 ----
     n = len(x)

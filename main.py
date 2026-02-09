@@ -103,6 +103,118 @@ def compute_jitter(t, x, y, window=5):
     return t_j, jitter
 
 
+def catmull_rom_spline_2d(x, y, samples_per_seg=25):
+    """用 Catmull-Rom 样条把 2D 点列平滑成曲线采样点。
+
+    说明：matplotlib 线段本质上仍是“点与点相连”，但通过样条插值生成更密的点，
+    视觉上是平滑曲线（不再是稀疏折线）。
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    n = len(x)
+    if n <= 2:
+        return x, y
+    if n == 3:
+        # 3 点不足以形成稳定的 CR 分段，做简单加密插值
+        t = np.linspace(0.0, 1.0, max(2, samples_per_seg), endpoint=True)
+        xx = np.interp(t, [0.0, 0.5, 1.0], x)
+        yy = np.interp(t, [0.0, 0.5, 1.0], y)
+        return xx, yy
+
+    # 端点复制 padding
+    px = np.concatenate([[x[0]], x, [x[-1]]])
+    py = np.concatenate([[y[0]], y, [y[-1]]])
+
+    ts = np.linspace(0.0, 1.0, max(5, samples_per_seg), endpoint=False)
+    xs = []
+    ys = []
+
+    # 分段：P1->P2
+    for i in range(1, n):
+        p0 = np.array([px[i - 1], py[i - 1]])
+        p1 = np.array([px[i], py[i]])
+        p2 = np.array([px[i + 1], py[i + 1]])
+        p3 = np.array([px[i + 2], py[i + 2]])
+
+        t = ts[:, None]
+        t2 = t * t
+        t3 = t2 * t
+        pts = 0.5 * (
+            (2.0 * p1)
+            + (-p0 + p2) * t
+            + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
+            + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3
+        )
+        xs.append(pts[:, 0])
+        ys.append(pts[:, 1])
+
+    # 追加最后一个点，保证收尾
+    xs = np.concatenate(xs + [x[-1:]])
+    ys = np.concatenate(ys + [y[-1:]])
+    return xs, ys
+
+
+def plot_xy_paths(pairs, out=Path("dataset/compare/trajectory_xy.png")):
+    """在二维坐标系 X-Y 上绘制轨迹路径（平滑曲线）。
+
+    展示方式：一行两图，左人工、右模型，便于对比。
+    """
+    if not pairs:
+        return
+    n = len(pairs)
+    colors = plt.cm.tab10(np.linspace(0, 1, max(n, 1)))
+
+    fig, (ax_h, ax_m) = plt.subplots(1, 2, figsize=(14, 6), sharex=True, sharey=True)
+    fig.suptitle(_L(f"二维轨迹路径对比（共 {n} 条）", f"2D Path (X-Y) Comparison ({n} traces)"), fontsize=13)
+
+    _h = _L("人工轨迹", "Human Trajectory")
+    _m = _L("模型轨迹", "Model Trajectory")
+
+    # 统一坐标范围（用原始点，不依赖插值）
+    all_x = np.concatenate([np.asarray(p["x_h"], dtype=float) for p in pairs] + [np.asarray(p["x_m"], dtype=float) for p in pairs])
+    all_y = np.concatenate([np.asarray(p["y_h"], dtype=float) for p in pairs] + [np.asarray(p["y_m"], dtype=float) for p in pairs])
+    xmin, xmax = float(np.min(all_x)), float(np.max(all_x))
+    ymin, ymax = float(np.min(all_y)), float(np.max(all_y))
+    pad_x = (xmax - xmin) * 0.05 + 1e-6
+    pad_y = (ymax - ymin) * 0.05 + 1e-6
+    xlim = (xmin - pad_x, xmax + pad_x)
+    ylim = (ymin - pad_y, ymax + pad_y)
+
+    for ax, title in [(ax_h, _h), (ax_m, _m)]:
+        ax.set_title(title)
+        ax.set_xlabel(_L("X (px)", "X (px)"))
+        ax.set_ylabel(_L("Y (px)", "Y (px)"))
+        ax.grid(True, alpha=0.3)
+        # sharex/sharey 同时开启时，adjustable='datalim' 会触发 Matplotlib 的限制
+        # 改用 adjustable='box' 以兼容 tight_layout，并保持等比例显示
+        ax.set_aspect("equal", adjustable="box")
+        ax.set_xlim(*xlim)
+        ax.set_ylim(*ylim)
+
+    for i, p in enumerate(pairs):
+        c = colors[i % len(colors)]
+        xh, yh = catmull_rom_spline_2d(p["x_h"], p["y_h"], samples_per_seg=30)
+        xm, ym = catmull_rom_spline_2d(p["x_m"], p["y_m"], samples_per_seg=30)
+
+        ax_h.plot(xh, yh, "-", color=c, linewidth=2.2, label=f"#{i+1}")
+        ax_m.plot(xm, ym, "-", color=c, linewidth=2.2, label=f"#{i+1}")
+
+        # 起终点标记（用原始点，避免插值偏差）
+        ax_h.plot(p["x_h"][0], p["y_h"][0], marker="o", color=c, markersize=5)
+        ax_h.plot(p["x_h"][-1], p["y_h"][-1], marker="x", color=c, markersize=6)
+        ax_m.plot(p["x_m"][0], p["y_m"][0], marker="o", color=c, markersize=5)
+        ax_m.plot(p["x_m"][-1], p["y_m"][-1], marker="x", color=c, markersize=6)
+
+    # legend 放到各自子图，避免太挤
+    ax_h.legend(loc="best", fontsize=8, title=_L("轨迹编号", "Trace #"))
+    ax_m.legend(loc="best", fontsize=8, title=_L("轨迹编号", "Trace #"))
+    out.parent.mkdir(parents=True, exist_ok=True)
+    plt.tight_layout()
+    plt.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"二维轨迹图已保存: {out}")
+
+
 def load_human_trajectories():
     """加载一条或多条人工轨迹。支持两种格式：
     - 单条：{"targetDistance": D, "points": [...]}
@@ -222,7 +334,7 @@ def plot_comparison():
         t_m_norm = (t_m - t_m[0]) / (t_m[-1] - t_m[0] + 1e-9)
         x_m_norm = (x_m - x_m[0]) / (x_m[-1] - x_m[0] + 1e-9)
         pairs.append({
-            "t_h": t_h, "x_h": x_h, "t_m": t_m, "x_m": x_m,
+            "t_h": t_h, "x_h": x_h, "y_h": y_h, "t_m": t_m, "x_m": x_m, "y_m": y_m,
             "t_h_mid": t_h_mid, "v_h": v_h, "t_m_mid": t_m_mid, "v_m": v_m,
             "t_h_a": t_h_a, "a_h": a_h, "t_m_a": t_m_a, "a_m": a_m,
             "s_h": s_h, "v_avg_h": v_avg_h, "s_m": s_m, "v_avg_m": v_avg_m,
@@ -230,6 +342,9 @@ def plot_comparison():
             "t_h_norm": t_h_norm, "x_h_norm": x_h_norm, "t_m_norm": t_m_norm, "x_m_norm": x_m_norm,
             "a_h": a_h, "a_m": a_m,
         })
+
+    # 新增：二维坐标系轨迹路径对比（曲线）
+    plot_xy_paths(pairs)
 
     colors = plt.cm.tab10(np.linspace(0, 1, max(n, 1)))
     fig, axes = plt.subplots(2, 4, figsize=(16, 9))

@@ -8,4 +8,5 @@ dependencies = [
     "numpy>=1.24",
     "torch>=2.0",
     "matplotlib>=3.7",
+    "pynput>=1.7",
 ]

@@ -19,9 +19,11 @@ from model.wgan import Generator, Discriminator
 LATENT_DIM = 64
 LAMBDA_GP = 10.0        # WGAN-GP 梯度惩罚
 LAMBDA_GEOM = 2.0       # 几何约束（终点距离），降低避免主导
-LAMBDA_SMOOTH = 1.0     # 平滑约束（惩罚 jerk），过大会压制抖动
+LAMBDA_SMOOTH = 2.0     # 平滑约束（惩罚 jerk），过大会压制抖动
 LAMBDA_SPREAD = 3.0     # 分散约束：防止位移集中在少数步
-LAMBDA_JITTER = 0.5     # 最小抖动约束：鼓励 dx 有人手般的自然波动
+LAMBDA_JITTER = 0.2     # 最小抖动约束：鼓励 dx 有人手般的自然波动（过大会引入过强波动）
+LAMBDA_DRAWDOWN = 2.0   # 回撤约束：惩罚 x(t) 从历史高点的大幅回撤
+DRAWDOWN_MARGIN_PX = 2.0  # 允许的微小回撤（px），超过部分才惩罚
 D_STEPS = 3             # D/G 训练比（减少以获得更多 G 更新）
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -97,6 +99,25 @@ def jitter_loss(fake_seq, min_std=0.04):
     return (min_std - std_per_sample).clamp(min=0).mean()
 
 
+def drawdown_loss(fake_seq, margin_px: float = DRAWDOWN_MARGIN_PX):
+    """
+    回撤约束：惩罚累积位移 x(t)=cumsum(dx) 相对历史最大值的回撤。
+
+    目的：你希望“整体上没有大幅度回撤”，允许极小的人类式回退（例如 1~2px），
+    但不希望出现明显逆行/回撤段。
+
+    fake_seq: (B, L, 2) 归一化空间
+    margin_px: 允许的回撤阈值（像素）。超过该阈值的回撤将被惩罚（平方惩罚，强调大回撤）。
+    """
+    dx = fake_seq[:, :, 0]  # (B, L) 归一化 dx
+    x = torch.cumsum(dx, dim=1)
+    run_max = torch.cummax(x, dim=1).values
+    dd = run_max - x
+    margin = float(margin_px) / float(NORM_SCALE)
+    dd_excess = (dd - margin).clamp(min=0.0)
+    return torch.mean(dd_excess ** 2)
+
+
 # ============================
 # 训练主循环
 # ============================
@@ -113,6 +134,8 @@ def train():
     parser.add_argument("--lambda-smooth", type=float, default=LAMBDA_SMOOTH)
     parser.add_argument("--lambda-spread", type=float, default=LAMBDA_SPREAD)
     parser.add_argument("--lambda-jitter", type=float, default=LAMBDA_JITTER)
+    parser.add_argument("--lambda-drawdown", type=float, default=LAMBDA_DRAWDOWN)
+    parser.add_argument("--drawdown-margin-px", type=float, default=DRAWDOWN_MARGIN_PX)
     args = parser.parse_args()
 
     # ---- 数据加载 ----
@@ -129,7 +152,8 @@ def train():
     print(f"超参: epochs={args.epochs}, batch_size={args.batch_size}, lr={args.lr}, d_steps={args.d_steps}")
     print(
         f"  λ_gp={args.lambda_gp}, λ_geom={args.lambda_geom}, "
-        f"λ_smooth={args.lambda_smooth}, λ_spread={args.lambda_spread}, λ_jitter={args.lambda_jitter}"
+        f"λ_smooth={args.lambda_smooth}, λ_spread={args.lambda_spread}, λ_jitter={args.lambda_jitter}, "
+        f"λ_drawdown={args.lambda_drawdown} (margin={args.drawdown_margin_px}px)"
     )
 
     # ---- 模型 ----
@@ -145,7 +169,7 @@ def train():
         G.train()
         D.train()
         d_loss_sum, g_loss_sum = 0.0, 0.0
-        geom_sum, smooth_sum, spread_sum, jitter_sum = 0.0, 0.0, 0.0, 0.0
+        geom_sum, smooth_sum, spread_sum, jitter_sum, dd_sum = 0.0, 0.0, 0.0, 0.0, 0.0
         n_d_steps, n_g_steps = 0, 0
 
         for step, (cond_np, seq_np) in enumerate(
@@ -180,12 +204,14 @@ def train():
                 loss_smooth = smoothness_loss(gen_seq)
                 loss_spread = spread_loss(gen_seq)
                 loss_jitter = jitter_loss(gen_seq)
+                loss_dd = drawdown_loss(gen_seq, margin_px=args.drawdown_margin_px)
 
                 g_loss = (loss_adv
                           + args.lambda_geom * loss_geom
                           + args.lambda_smooth * loss_smooth
                           + args.lambda_spread * loss_spread
-                          + args.lambda_jitter * loss_jitter)
+                          + args.lambda_jitter * loss_jitter
+                          + args.lambda_drawdown * loss_dd)
 
                 g_opt.zero_grad()
                 g_loss.backward()
@@ -196,6 +222,7 @@ def train():
                 smooth_sum += loss_smooth.item()
                 spread_sum += loss_spread.item()
                 jitter_sum += loss_jitter.item()
+                dd_sum += loss_dd.item()
                 n_g_steps += 1
 
         # ---- 日志 ----
@@ -206,11 +233,12 @@ def train():
             smooth_avg = smooth_sum / max(n_g_steps, 1)
             spread_avg = spread_sum / max(n_g_steps, 1)
             jitter_avg = jitter_sum / max(n_g_steps, 1)
+            dd_avg = dd_sum / max(n_g_steps, 1)
             print(
                 f"Epoch {epoch+1}/{args.epochs}  "
                 f"D={d_avg:.4f}  G={g_avg:.4f}  "
                 f"Geom={geom_avg:.4f}  Smooth={smooth_avg:.6f}  "
-                f"Spread={spread_avg:.4f}  Jitter={jitter_avg:.4f}"
+                f"Spread={spread_avg:.4f}  Jitter={jitter_avg:.4f}  Drawdown={dd_avg:.6f}"
             )
 
         # ---- 定期保存 ----
