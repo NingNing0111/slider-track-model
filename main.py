@@ -1,0 +1,293 @@
+"""
+对比绘制：dataset/compare/index.json（页面导出）与模型生成轨迹的对比图。
+包含：轨迹 X-T、速度-时间、加速度-时间、平均速度-轨迹长度、抖动/方差分析。
+"""
+from pathlib import Path
+import json
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib import rcParams
+
+from inference import load_generator, generate_trajectory
+
+rcParams["font.sans-serif"] = ["SimHei", "Microsoft YaHei", "DejaVu Sans"]
+rcParams["axes.unicode_minus"] = False
+
+COMPARE_DIR = Path("dataset/compare")
+INDEX_JSON = COMPARE_DIR / "index.json"
+MODEL_CKPT = Path("checkpoints/wgan.pt")
+MODEL_JSON = COMPARE_DIR / "model.json"
+
+
+def points_to_arrays(points):
+    """points [{x,y,t}, ...] -> t, x, y 数组。"""
+    t = np.array([p["t"] for p in points], dtype=float)
+    x = np.array([p["x"] for p in points], dtype=float)
+    y = np.array([p["y"] for p in points], dtype=float)
+    return t, x, y
+
+
+def compute_velocity_and_acceleration(t, x, y):
+    """由 t,x,y 计算速度 v (标量: 沿路径) 和加速度 a。"""
+    if len(t) < 2:
+        return np.array([0]), np.array([0]), np.array([0]), np.array([0])
+    dt = np.diff(t)
+    dt = np.maximum(dt, 1e-6)
+    dx = np.diff(x)
+    dy = np.diff(y)
+    ds = np.sqrt(dx**2 + dy**2)
+    v = ds / dt
+    t_mid = (t[:-1] + t[1:]) / 2
+    if len(v) < 2:
+        return t_mid, v, t_mid, np.zeros_like(v)
+    dv = np.diff(v)
+    dt_mid = np.diff(t_mid)
+    dt_mid = np.maximum(dt_mid, 1e-6)
+    a = dv / dt_mid
+    t_acc = (t_mid[:-1] + t_mid[1:]) / 2
+    return t_mid, v, t_acc, a
+
+
+def compute_distance_and_avg_speed(t, x, y):
+    """沿轨迹的累计距离 s 与到每点的平均速度 (s, v_avg)。"""
+    if len(t) < 2:
+        return np.array([0]), np.array([0]), t
+    dx = np.diff(x)
+    dy = np.diff(y)
+    ds = np.sqrt(dx**2 + dy**2)
+    s = np.cumsum(ds)
+    s = np.concatenate([[0], s])
+    t_cum = t - t[0]
+    t_cum = np.maximum(t_cum, 1e-6)
+    v_avg = s / t_cum
+    return s, v_avg, t
+
+
+def compute_jitter(t, x, y, window=5):
+    """滑动窗口内位移的方差作为抖动。返回与 t 对齐的 jitter 序列。"""
+    if len(t) < 2:
+        return np.array([0]), np.array([0])
+    dx = np.diff(x)
+    dy = np.diff(y)
+    ds = np.sqrt(dx**2 + dy**2)
+    n = len(ds)
+    jitter = np.zeros(n)
+    half = window // 2
+    for i in range(n):
+        lo = max(0, i - half)
+        hi = min(n, i + half + 1)
+        jitter[i] = np.var(ds[lo:hi]) if hi > lo else 0
+    t_j = (t[:-1] + t[1:]) / 2
+    return t_j, jitter
+
+
+def load_human_trajectories():
+    """加载一条或多条人工轨迹。支持两种格式：
+    - 单条：{"targetDistance": D, "points": [...]}
+    - 多条：{"trajectories": [{"targetDistance": D, "points": [...]}, ...]}
+    返回：[(targetDistance, points), ...]
+    """
+    path = INDEX_JSON
+    if not path.exists():
+        raise FileNotFoundError(f"请先从采集页面导出轨迹到 {path}（可单条或多条）")
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if "trajectories" in data:
+        return [(t["targetDistance"], t["points"]) for t in data["trajectories"]]
+    if "points" in data:
+        return [(data["targetDistance"], data["points"])]
+    raise ValueError(f"{path} 格式无效，需包含 'points' 或 'trajectories'")
+
+
+def get_model_trajectory(target_distance, force_regenerate=False):
+    """优先用当前模型重新生成（含时间缩放）；无模型时再读已有 model.json。"""
+    def _should_regenerate():
+        if force_regenerate or not MODEL_JSON.exists():
+            return True
+        with open(MODEL_JSON, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if "trajectories" in data:
+            for t in data["trajectories"]:
+                if abs(t.get("targetDistance", -1) - target_distance) < 1:
+                    return False
+            return True
+        return abs(data.get("targetDistance", -1) - target_distance) > 1
+
+    if MODEL_CKPT.exists() and _should_regenerate():
+        G = load_generator(MODEL_CKPT)
+        points = generate_trajectory(G, target_distance, seed=42)
+        COMPARE_DIR.mkdir(parents=True, exist_ok=True)
+        with open(MODEL_JSON, "w", encoding="utf-8") as f:
+            json.dump({"targetDistance": target_distance, "points": points}, f, indent=2)
+        return points
+    if MODEL_JSON.exists():
+        with open(MODEL_JSON, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if "trajectories" in data:
+            for t in data["trajectories"]:
+                if abs(t["targetDistance"] - target_distance) < 1:
+                    return t["points"]
+        if "points" in data and abs(data["targetDistance"] - target_distance) < 1:
+            return data["points"]
+    raise FileNotFoundError(
+        f"未找到模型 {MODEL_CKPT}，请先运行 train.py 训练；"
+        "或手动将模型生成的 trajectory 保存为 dataset/compare/model.json"
+    )
+
+
+def get_model_trajectories(target_distances, force_regenerate=False):
+    """批量获取多条模型轨迹；多条时统一写入 model.json 为 {"trajectories": [...]}。"""
+    if not target_distances:
+        return []
+    if len(target_distances) == 1:
+        return [get_model_trajectory(target_distances[0], force_regenerate)]
+
+    def _cached_all():
+        if not MODEL_JSON.exists():
+            return False
+        with open(MODEL_JSON, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if "trajectories" not in data or len(data["trajectories"]) != len(target_distances):
+            return False
+        for t, D in zip(data["trajectories"], target_distances):
+            if abs(t.get("targetDistance", -1) - D) > 1:
+                return False
+        return True
+
+    if MODEL_CKPT.exists() and (force_regenerate or not _cached_all()):
+        G = load_generator(MODEL_CKPT)
+        trajectories = []
+        for i, D in enumerate(target_distances):
+            points = generate_trajectory(G, D, seed=42 + i)
+            trajectories.append({"targetDistance": D, "points": points})
+        COMPARE_DIR.mkdir(parents=True, exist_ok=True)
+        with open(MODEL_JSON, "w", encoding="utf-8") as f:
+            json.dump({"trajectories": trajectories}, f, indent=2)
+        return [t["points"] for t in trajectories]
+
+    if MODEL_JSON.exists():
+        with open(MODEL_JSON, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if "trajectories" in data:
+            by_d = {t["targetDistance"]: t["points"] for t in data["trajectories"]}
+            return [by_d[D] for D in target_distances]
+    raise FileNotFoundError(
+        f"未找到模型 {MODEL_CKPT}，请先运行 train.py 训练；"
+        "或手动将模型轨迹保存为 dataset/compare/model.json（含 trajectories 数组）"
+    )
+
+
+def plot_comparison():
+    human_list = load_human_trajectories()
+    target_distances = [D for D, _ in human_list]
+    model_list = get_model_trajectories(target_distances, force_regenerate=True)
+    n = len(human_list)
+    assert n == len(model_list), "人工轨迹与模型轨迹条数不一致"
+
+    # 为每条轨迹计算各类曲线
+    pairs = []
+    for (D, human_pts), model_pts in zip(human_list, model_list):
+        t_h, x_h, y_h = points_to_arrays(human_pts)
+        t_m, x_m, y_m = points_to_arrays(model_pts)
+        t_h_mid, v_h, t_h_a, a_h = compute_velocity_and_acceleration(t_h, x_h, y_h)
+        t_m_mid, v_m, t_m_a, a_m = compute_velocity_and_acceleration(t_m, x_m, y_m)
+        s_h, v_avg_h, _ = compute_distance_and_avg_speed(t_h, x_h, y_h)
+        s_m, v_avg_m, _ = compute_distance_and_avg_speed(t_m, x_m, y_m)
+        t_j_h, jitter_h = compute_jitter(t_h, x_h, y_h)
+        t_j_m, jitter_m = compute_jitter(t_m, x_m, y_m)
+        t_h_norm = (t_h - t_h[0]) / (t_h[-1] - t_h[0] + 1e-9)
+        x_h_norm = (x_h - x_h[0]) / (x_h[-1] - x_h[0] + 1e-9)
+        t_m_norm = (t_m - t_m[0]) / (t_m[-1] - t_m[0] + 1e-9)
+        x_m_norm = (x_m - x_m[0]) / (x_m[-1] - x_m[0] + 1e-9)
+        pairs.append({
+            "t_h": t_h, "x_h": x_h, "t_m": t_m, "x_m": x_m,
+            "t_h_mid": t_h_mid, "v_h": v_h, "t_m_mid": t_m_mid, "v_m": v_m,
+            "t_h_a": t_h_a, "a_h": a_h, "t_m_a": t_m_a, "a_m": a_m,
+            "s_h": s_h, "v_avg_h": v_avg_h, "s_m": s_m, "v_avg_m": v_avg_m,
+            "t_j_h": t_j_h, "jitter_h": jitter_h, "t_j_m": t_j_m, "jitter_m": jitter_m,
+            "t_h_norm": t_h_norm, "x_h_norm": x_h_norm, "t_m_norm": t_m_norm, "x_m_norm": x_m_norm,
+            "a_h": a_h, "a_m": a_m,
+        })
+
+    colors = plt.cm.tab10(np.linspace(0, 1, max(n, 1)))
+    fig, axes = plt.subplots(2, 4, figsize=(16, 9))
+    fig.suptitle(f"人工轨迹 vs 模型轨迹 对比（共 {n} 条）", fontsize=13)
+
+    def add_curves(ax, plot_fn, x_label=None, y_label=None, title=None):
+        for i, p in enumerate(pairs):
+            c = colors[i % len(colors)]
+            plot_fn(ax, p, i, c)
+        if x_label:
+            ax.set_xlabel(x_label)
+        if y_label:
+            ax.set_ylabel(y_label)
+        if title:
+            ax.set_title(title)
+        ax.legend(loc="best", fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+    # 1. 位移-时间 X vs T
+    def plot_xt(ax, p, i, c):
+        ax.plot(p["t_h"], p["x_h"], "-", color=c, linewidth=2, label=f"#{i+1} 人工")
+        ax.plot(p["t_m"], p["x_m"], "--", color=c, linewidth=1.5, label=f"#{i+1} 模型")
+    add_curves(axes[0, 0], plot_xt, "时间 T (ms)", "位移 X (px)", "位移-时间 (X vs T)")
+
+    # 2. 速度-时间
+    def plot_vt(ax, p, i, c):
+        ax.plot(p["t_h_mid"], p["v_h"], "-", color=c, linewidth=2, label=f"#{i+1} 人工")
+        ax.plot(p["t_m_mid"], p["v_m"], "--", color=c, linewidth=1.5, label=f"#{i+1} 模型")
+    add_curves(axes[0, 1], plot_vt, "时间 T (ms)", "速度 (px/ms)", "速度-时间 (Velocity vs Time)")
+
+    # 3. 加速度-时间
+    def plot_at(ax, p, i, c):
+        ax.plot(p["t_h_a"], p["a_h"], "-", color=c, linewidth=2, label=f"#{i+1} 人工")
+        ax.plot(p["t_m_a"], p["a_m"], "--", color=c, linewidth=1.5, label=f"#{i+1} 模型")
+    add_curves(axes[0, 2], plot_at, "时间 T (ms)", "加速度", "加速度-时间 (Acceleration vs Time)")
+
+    # 4. 归一化形态
+    def plot_norm(ax, p, i, c):
+        ax.plot(p["t_h_norm"], p["x_h_norm"], "-", color=c, linewidth=2, label=f"#{i+1} 人工")
+        ax.plot(p["t_m_norm"], p["x_m_norm"], "--", color=c, linewidth=1.5, label=f"#{i+1} 模型")
+    add_curves(axes[0, 3], plot_norm, "归一化时间 (0~1)", "归一化位移 (0~1)", "形态对比：位移/时间 归一化")
+
+    # 5. 平均速度 vs 轨迹长度
+    def plot_avgv(ax, p, i, c):
+        ax.plot(p["s_h"], p["v_avg_h"], "-", color=c, linewidth=2, label=f"#{i+1} 人工")
+        ax.plot(p["s_m"], p["v_avg_m"], "--", color=c, linewidth=1.5, label=f"#{i+1} 模型")
+    add_curves(axes[1, 0], plot_avgv, "轨迹长度 / 距离 (px)", "平均速度 (px/ms)", "平均速度 vs 轨迹长度")
+
+    # 6. 抖动
+    def plot_jitter(ax, p, i, c):
+        ax.plot(p["t_j_h"], p["jitter_h"], "-", color=c, linewidth=2, label=f"#{i+1} 人工")
+        ax.plot(p["t_j_m"], p["jitter_m"], "--", color=c, linewidth=1.5, label=f"#{i+1} 模型")
+    add_curves(axes[1, 1], plot_jitter, "时间 T (ms)", "抖动 (位移方差)", "抖动/方差 (Jitter vs Time)")
+
+    # 7. 加速度分布直方图（多条叠加）
+    ax = axes[1, 2]
+    for i, p in enumerate(pairs):
+        c = colors[i % len(colors)]
+        ax.hist(p["a_h"], bins=20, alpha=0.4, label=f"#{i+1} 人工", color=c, density=True, histtype="step", linewidth=2)
+        ax.hist(p["a_m"], bins=20, alpha=0.4, label=f"#{i+1} 模型", color=c, density=True, histtype="step", linestyle="--")
+    ax.set_xlabel("加速度")
+    ax.set_ylabel("密度")
+    ax.set_title("加速度分布 (Acceleration Distribution)")
+    ax.legend(loc="best", fontsize=8)
+    ax.grid(True, alpha=0.3)
+
+    axes[1, 3].set_visible(False)
+
+    plt.tight_layout()
+    out = Path("dataset/compare/comparison.png")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    plt.savefig(out, dpi=150, bbox_inches="tight")
+    plt.show()
+    print(f"对比图已保存: {out}（共 {n} 条轨迹）")
+
+
+def main():
+    print("加载 compare 轨迹并生成模型轨迹，绘制对比图…")
+    plot_comparison()
+
+
+if __name__ == "__main__":
+    main()
