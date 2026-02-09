@@ -28,6 +28,26 @@ def _target_duration_ms(target_distance):
     return 80 + 0.35 * min(target_distance, 400)
 
 
+def _colored_noise(n: int, std: float, alpha: float = 0.85) -> np.ndarray:
+    """
+    生成一段一阶自回归(AR(1))的“有相关性噪声”，更像手部微抖而非白噪声。
+    - alpha 越大相关性越强、越“平滑”
+    - std 为输出标准差（像素）
+    """
+    if n <= 0 or std <= 0:
+        return np.zeros(max(n, 0), dtype=np.float64)
+    eps = np.random.normal(0, 1.0, size=n).astype(np.float64)
+    x = np.zeros(n, dtype=np.float64)
+    for i in range(1, n):
+        x[i] = alpha * x[i - 1] + eps[i]
+    s = np.std(x)
+    if s > 1e-9:
+        x = x / s * std
+    else:
+        x = x * 0.0
+    return x
+
+
 def generate_trajectory(
     G,
     target_distance,
@@ -36,6 +56,8 @@ def generate_trajectory(
     warp_time_front_heavy=True,
     add_jitter=True,
     jitter_std_px=0.9,
+    jitter_alpha=0.85,
+    ensure_monotonic_time=True,
 ):
     """
     给定目标距离（像素），生成一条轨迹 points: [{x, y, t}, ...]。
@@ -58,8 +80,9 @@ def generate_trajectory(
 
     # 可选：加小幅抖动
     if add_jitter and jitter_std_px > 0:
-        dx = dx + np.random.normal(0, jitter_std_px, size=dx.shape)
-        dy = dy + np.random.normal(0, jitter_std_px * 0.5, size=dy.shape)
+        # 用相关噪声模拟“手抖”，避免白噪声那种不真实的高频毛刺
+        dx = dx + _colored_noise(len(dx), std=jitter_std_px, alpha=jitter_alpha)
+        dy = dy + _colored_noise(len(dy), std=jitter_std_px * 0.5, alpha=jitter_alpha)
 
     # 累加位移
     x = np.cumsum(np.concatenate([[0], dx]))
@@ -90,6 +113,18 @@ def generate_trajectory(
             t = t_frac * target_t
         else:
             t = t / t[-1] * target_t
+
+        # 时间必须单调递增，否则 dt≈0 会导致速度/加速度计算出现极大尖峰
+        if ensure_monotonic_time:
+            t = np.asarray(t, dtype=np.float64)
+            # 先去掉可能的回退/重复
+            t = np.maximum.accumulate(t)
+            # 再强制严格递增（微小 epsilon 递增），最后重新缩放到 target_t
+            eps = 1e-3  # ms
+            t = np.maximum.accumulate(t + np.arange(len(t), dtype=np.float64) * eps)
+            denom = (t[-1] - t[0])
+            if denom > 1e-9:
+                t = (t - t[0]) / denom * target_t
 
     n = len(x)
     points = [{"x": float(x[i]), "y": float(y[i]), "t": float(t[i])} for i in range(n)]

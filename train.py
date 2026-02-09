@@ -19,7 +19,8 @@ from model.wgan import Generator, Discriminator
 LATENT_DIM = 64
 LAMBDA_GP = 10.0        # WGAN-GP 梯度惩罚
 LAMBDA_GEOM = 5.0       # 几何约束（终点距离）
-LAMBDA_SMOOTH = 2.0     # 平滑约束（抗尖刺）
+# 重要：该项会显著“变平滑”。如果你觉得生成轨迹过于光滑，把它降到 0~0.2，甚至置 0。
+LAMBDA_SMOOTH = 0.2     # 平滑约束（惩罚 jerk，默认降低）
 D_STEPS = 5             # 判别器每训练 D_STEPS 次，生成器训练 1 次
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -75,6 +76,10 @@ def train():
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--out", type=str, default="checkpoints", help="模型保存目录")
+    parser.add_argument("--d-steps", type=int, default=D_STEPS, help="判别器训练步数/生成器步数比")
+    parser.add_argument("--lambda-gp", type=float, default=LAMBDA_GP, help="WGAN-GP 梯度惩罚权重")
+    parser.add_argument("--lambda-geom", type=float, default=LAMBDA_GEOM, help="终点几何约束权重")
+    parser.add_argument("--lambda-smooth", type=float, default=LAMBDA_SMOOTH, help="平滑(jerk)惩罚权重；过于光滑就调小")
     args = parser.parse_args()
 
     # ---- 数据加载 ----
@@ -89,7 +94,11 @@ def train():
     print(f"训练样本数: {len(train_samples)}, 测试样本数: {len(test_samples)}")
     print(f"序列长度: {SEQ_LEN}, 特征维度: 2 (dx, dy), 设备: {DEVICE}")
     print(f"超参: epochs={args.epochs}, batch_size={args.batch_size}, lr={args.lr}")
-    print(f"  LAMBDA_GP={LAMBDA_GP}, LAMBDA_GEOM={LAMBDA_GEOM}, LAMBDA_SMOOTH={LAMBDA_SMOOTH}, D_STEPS={D_STEPS}")
+    print(
+        "  "
+        f"LAMBDA_GP={args.lambda_gp}, LAMBDA_GEOM={args.lambda_geom}, "
+        f"LAMBDA_SMOOTH={args.lambda_smooth}, D_STEPS={args.d_steps}"
+    )
 
     # ---- 模型 ----
     G = Generator(max_len=SEQ_LEN).to(DEVICE)
@@ -119,7 +128,7 @@ def train():
             d_real = D(real, cond)
             d_fake = D(fake, cond)
             gp = gradient_penalty(D, real, fake, cond)
-            d_loss = d_fake.mean() - d_real.mean() + LAMBDA_GP * gp
+            d_loss = d_fake.mean() - d_real.mean() + args.lambda_gp * gp
 
             d_opt.zero_grad()
             d_loss.backward()
@@ -129,7 +138,7 @@ def train():
             n_d_steps += 1
 
             # ---- 生成器 (每 D_STEPS 步训练一次) ----
-            if step % D_STEPS == 0:
+            if step % args.d_steps == 0:
                 z = torch.randn(B, LATENT_DIM, device=DEVICE)
                 gen_seq = G(z, cond)
 
@@ -137,7 +146,7 @@ def train():
                 loss_geom = geometry_loss(gen_seq, cond)
                 loss_smooth = smoothness_loss(gen_seq)
 
-                g_loss = loss_adv + LAMBDA_GEOM * loss_geom + LAMBDA_SMOOTH * loss_smooth
+                g_loss = loss_adv + args.lambda_geom * loss_geom + args.lambda_smooth * loss_smooth
 
                 g_opt.zero_grad()
                 g_loss.backward()
