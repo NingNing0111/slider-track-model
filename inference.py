@@ -1,5 +1,9 @@
 """
-推理：根据目标距离生成一条轨迹（v2: 2D 模型输出 dx/dy，时间用固定间隔重建）。
+推理：根据目标距离生成一条轨迹（v2: 2D 模型输出 dx/dy，时间用等间隔重建）。
+
+核心思想：
+  训练时通过等时间间隔重采样把速度信息编码进 dx 分布，
+  推理时只需还原为等间隔时间轴即可，不需要额外 warp。
 """
 from pathlib import Path
 import json
@@ -23,17 +27,16 @@ def load_generator(checkpoint_path="checkpoints/wgan.pt"):
     return G
 
 
-def _target_duration_ms(target_distance):
-    """人工轨迹典型时长（ms）：距离越长略增，约 80~200ms。"""
-    return 80 + 0.35 * min(target_distance, 400)
+def _estimate_duration_ms(target_distance):
+    """
+    估算人工轨迹典型总时长（ms）。
+    从采集数据观察：200px ≈ 1200~1800ms，50px ≈ 600~1000ms。
+    """
+    return max(400, 600 + 4.5 * min(target_distance, 400))
 
 
 def _colored_noise(n: int, std: float, alpha: float = 0.85) -> np.ndarray:
-    """
-    生成一段一阶自回归(AR(1))的“有相关性噪声”，更像手部微抖而非白噪声。
-    - alpha 越大相关性越强、越“平滑”
-    - std 为输出标准差（像素）
-    """
+    """AR(1) 相关噪声，模拟手部微抖。"""
     if n <= 0 or std <= 0:
         return np.zeros(max(n, 0), dtype=np.float64)
     eps = np.random.normal(0, 1.0, size=n).astype(np.float64)
@@ -43,8 +46,6 @@ def _colored_noise(n: int, std: float, alpha: float = 0.85) -> np.ndarray:
     s = np.std(x)
     if s > 1e-9:
         x = x / s * std
-    else:
-        x = x * 0.0
     return x
 
 
@@ -52,16 +53,17 @@ def generate_trajectory(
     G,
     target_distance,
     seed=None,
-    scale_time_to_human=True,
-    warp_time_front_heavy=True,
     add_jitter=True,
-    jitter_std_px=0.9,
+    jitter_std_px=0.8,
     jitter_alpha=0.85,
-    ensure_monotonic_time=True,
 ):
     """
     给定目标距离（像素），生成一条轨迹 points: [{x, y, t}, ...]。
-    v2: 模型只输出 (dx, dy)，时间由固定间隔 DT_MS 构建，再缩放到人工时长范围。
+
+    时间重建策略：
+      训练数据已通过等时间间隔重采样，dx 本身编码了速度信息。
+      推理时用等间隔时间轴 + 缩放到人工典型总时长即可。
+      不做 power warp（会破坏 dx 已编码的速度分布）。
     """
     if seed is not None:
         torch.manual_seed(seed)
@@ -78,9 +80,8 @@ def generate_trajectory(
     dx = seq[:, 0] * NORM_SCALE
     dy = seq[:, 1] * NORM_SCALE
 
-    # 可选：加小幅抖动
+    # 可选：加相关噪声模拟手抖
     if add_jitter and jitter_std_px > 0:
-        # 用相关噪声模拟“手抖”，避免白噪声那种不真实的高频毛刺
         dx = dx + _colored_noise(len(dx), std=jitter_std_px, alpha=jitter_alpha)
         dy = dy + _colored_noise(len(dy), std=jitter_std_px * 0.5, alpha=jitter_alpha)
 
@@ -94,39 +95,22 @@ def generate_trajectory(
         dx = np.ones(n_step, dtype=np.float64) * (target_distance / n_step)
     else:
         dx = dx * (target_distance / total_x)
+
     x = np.cumsum(np.concatenate([[0], dx]))
     y = np.cumsum(np.concatenate([[0], dy]))
 
-    # 时间：每步固定 DT_MS（10ms），加随机抖动 ±1ms
-    n_step = len(dx)
-    dt_arr = np.full(n_step, DT_MS) + np.random.uniform(-1.0, 1.0, size=n_step)
-    dt_arr = np.maximum(dt_arr, 1.0)
-    t = np.cumsum(np.concatenate([[0], dt_arr]))
-
-    # 缩放总时长到人工典型范围
-    if scale_time_to_human and t[-1] > 1e-6:
-        target_t = _target_duration_ms(target_distance)
-        if warp_time_front_heavy:
-            # 按位移比例重映射时间，前段快、后段慢
-            x_frac = (x - x[0]) / (x[-1] - x[0] + 1e-9)
-            t_frac = np.power(x_frac, 2.0)
-            t = t_frac * target_t
-        else:
-            t = t / t[-1] * target_t
-
-        # 时间必须单调递增，否则 dt≈0 会导致速度/加速度计算出现极大尖峰
-        if ensure_monotonic_time:
-            t = np.asarray(t, dtype=np.float64)
-            # 先去掉可能的回退/重复
-            t = np.maximum.accumulate(t)
-            # 再强制严格递增（微小 epsilon 递增），最后重新缩放到 target_t
-            eps = 1e-3  # ms
-            t = np.maximum.accumulate(t + np.arange(len(t), dtype=np.float64) * eps)
-            denom = (t[-1] - t[0])
-            if denom > 1e-9:
-                t = (t - t[0]) / denom * target_t
-
+    # ---- 时间重建：等间隔 + 小抖动，缩放到人工典型总时长 ----
     n = len(x)
+    total_time = _estimate_duration_ms(target_distance)
+    # 等间隔时间轴 + ±1ms 随机抖动
+    t = np.linspace(0, total_time, n)
+    jitter_t = np.zeros(n)
+    jitter_t[1:-1] = np.random.uniform(-1.0, 1.0, size=n - 2)
+    t = t + jitter_t
+    # 保证单调递增
+    t = np.maximum.accumulate(t)
+    t[0] = 0.0
+
     points = [{"x": float(x[i]), "y": float(y[i]), "t": float(t[i])} for i in range(n)]
     return points
 

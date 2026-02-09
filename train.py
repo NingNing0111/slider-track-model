@@ -2,8 +2,8 @@
 训练脚本（v2 思路）：
 - 重采样预处理（等时间间隔插值，固定序列长度 128）
 - 2D 输出 (dx, dy)，去掉 dt
-- WGAN-GP：D 训练 5 次，G 训练 1 次
-- 辅助 Loss：geometry_loss（终点约束）+ smoothness_loss（平滑约束）
+- WGAN-GP：D 训练 D_STEPS 次，G 训练 1 次
+- 辅助 Loss：geometry（终点）+ smoothness（jerk）+ spread（防集中）
 """
 from pathlib import Path
 import argparse
@@ -18,10 +18,10 @@ from model.wgan import Generator, Discriminator
 
 LATENT_DIM = 64
 LAMBDA_GP = 10.0        # WGAN-GP 梯度惩罚
-LAMBDA_GEOM = 5.0       # 几何约束（终点距离）
-# 重要：该项会显著“变平滑”。如果你觉得生成轨迹过于光滑，把它降到 0~0.2，甚至置 0。
-LAMBDA_SMOOTH = 0.0     # 平滑约束（惩罚 jerk）；想要更多细节时建议默认关闭
-D_STEPS = 5             # 判别器每训练 D_STEPS 次，生成器训练 1 次
+LAMBDA_GEOM = 2.0       # 几何约束（终点距离），降低避免主导
+LAMBDA_SMOOTH = 5.0     # 平滑约束（惩罚 jerk），防止尖刺
+LAMBDA_SPREAD = 3.0     # 分散约束：防止位移集中在少数步
+D_STEPS = 3             # D/G 训练比（减少以获得更多 G 更新）
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
@@ -51,19 +51,37 @@ def geometry_loss(fake_seq, cond):
     fake_seq: (B, L, 2), 归一化空间
     cond: (B, 1), target_dist / D_MAX
     """
-    total_dx = fake_seq[:, :, 0].sum(dim=1)                   # 归一化空间的总 dx
-    target_val = cond.squeeze(1) * (D_MAX / NORM_SCALE)        # 转到同空间
+    total_dx = fake_seq[:, :, 0].sum(dim=1)
+    target_val = cond.squeeze(1) * (D_MAX / NORM_SCALE)
     return F.mse_loss(total_dx, target_val)
 
 
 def smoothness_loss(fake_seq):
     """
-    平滑约束：惩罚加加速度 (Jerk)，消除生成轨迹的尖刺。
+    平滑约束：惩罚 jerk（三阶运动量），消除生成轨迹的尖刺。
     fake_seq: (B, L, 2)
     """
-    vel_diff = fake_seq[:, 1:, :] - fake_seq[:, :-1, :]       # 一阶差分 (加速度)
-    acc_diff = vel_diff[:, 1:, :] - vel_diff[:, :-1, :]        # 二阶差分 (Jerk)
+    vel_diff = fake_seq[:, 1:, :] - fake_seq[:, :-1, :]        # 一阶差分
+    acc_diff = vel_diff[:, 1:, :] - vel_diff[:, :-1, :]         # 二阶差分 (jerk)
     return torch.mean(acc_diff ** 2)
+
+
+def spread_loss(fake_seq):
+    """
+    分散约束：防止位移集中在少数几步。
+    - 惩罚单步最大贡献超过阈值（对 128 步，理想 < 5%）
+    - 惩罚负向位移（滑块应基本向前）
+    fake_seq: (B, L, 2)
+    """
+    dx = fake_seq[:, :, 0]                                      # (B, L)
+    abs_dx = dx.abs()
+    total = abs_dx.sum(dim=1, keepdim=True).clamp(min=1e-6)
+    # 最大单步占比
+    max_contrib = (abs_dx / total).max(dim=1)[0]                # (B,)
+    concentration = (max_contrib - 0.05).clamp(min=0).mean()
+    # 负向位移惩罚（滑块应向前移动）
+    backward = (-dx).clamp(min=0).mean()
+    return concentration + backward
 
 
 # ============================
@@ -73,13 +91,14 @@ def train():
     parser = argparse.ArgumentParser(description="Train WGAN-GP (v2)")
     parser.add_argument("--data-dir", type=str, default="dataset", help="dataset 根目录")
     parser.add_argument("--epochs", type=int, default=2000)
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--batch-size", type=int, default=32, help="较小 batch 以获得更多 G 更新")
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--out", type=str, default="checkpoints", help="模型保存目录")
-    parser.add_argument("--d-steps", type=int, default=D_STEPS, help="判别器训练步数/生成器步数比")
-    parser.add_argument("--lambda-gp", type=float, default=LAMBDA_GP, help="WGAN-GP 梯度惩罚权重")
-    parser.add_argument("--lambda-geom", type=float, default=LAMBDA_GEOM, help="终点几何约束权重")
-    parser.add_argument("--lambda-smooth", type=float, default=LAMBDA_SMOOTH, help="平滑(jerk)惩罚权重；过于光滑就调小")
+    parser.add_argument("--d-steps", type=int, default=D_STEPS)
+    parser.add_argument("--lambda-gp", type=float, default=LAMBDA_GP)
+    parser.add_argument("--lambda-geom", type=float, default=LAMBDA_GEOM)
+    parser.add_argument("--lambda-smooth", type=float, default=LAMBDA_SMOOTH)
+    parser.add_argument("--lambda-spread", type=float, default=LAMBDA_SPREAD)
     args = parser.parse_args()
 
     # ---- 数据加载 ----
@@ -93,11 +112,10 @@ def train():
 
     print(f"训练样本数: {len(train_samples)}, 测试样本数: {len(test_samples)}")
     print(f"序列长度: {SEQ_LEN}, 特征维度: 2 (dx, dy), 设备: {DEVICE}")
-    print(f"超参: epochs={args.epochs}, batch_size={args.batch_size}, lr={args.lr}")
+    print(f"超参: epochs={args.epochs}, batch_size={args.batch_size}, lr={args.lr}, d_steps={args.d_steps}")
     print(
-        "  "
-        f"LAMBDA_GP={args.lambda_gp}, LAMBDA_GEOM={args.lambda_geom}, "
-        f"LAMBDA_SMOOTH={args.lambda_smooth}, D_STEPS={args.d_steps}"
+        f"  λ_gp={args.lambda_gp}, λ_geom={args.lambda_geom}, "
+        f"λ_smooth={args.lambda_smooth}, λ_spread={args.lambda_spread}"
     )
 
     # ---- 模型 ----
@@ -112,7 +130,8 @@ def train():
     for epoch in range(args.epochs):
         G.train()
         D.train()
-        d_loss_sum, g_loss_sum, geom_sum, smooth_sum = 0.0, 0.0, 0.0, 0.0
+        d_loss_sum, g_loss_sum = 0.0, 0.0
+        geom_sum, smooth_sum, spread_sum = 0.0, 0.0, 0.0
         n_d_steps, n_g_steps = 0, 0
 
         for step, (cond_np, seq_np) in enumerate(
@@ -123,7 +142,7 @@ def train():
             B = real.size(0)
             z = torch.randn(B, LATENT_DIM, device=DEVICE)
 
-            # ---- 判别器 (每步都训练) ----
+            # ---- 判别器 ----
             fake = G(z, cond).detach()
             d_real = D(real, cond)
             d_fake = D(fake, cond)
@@ -137,7 +156,7 @@ def train():
             d_loss_sum += d_loss.item()
             n_d_steps += 1
 
-            # ---- 生成器 (每 D_STEPS 步训练一次) ----
+            # ---- 生成器（每 d_steps 步训练一次）----
             if step % args.d_steps == 0:
                 z = torch.randn(B, LATENT_DIM, device=DEVICE)
                 gen_seq = G(z, cond)
@@ -145,8 +164,12 @@ def train():
                 loss_adv = -D(gen_seq, cond).mean()
                 loss_geom = geometry_loss(gen_seq, cond)
                 loss_smooth = smoothness_loss(gen_seq)
+                loss_spread = spread_loss(gen_seq)
 
-                g_loss = loss_adv + args.lambda_geom * loss_geom + args.lambda_smooth * loss_smooth
+                g_loss = (loss_adv
+                          + args.lambda_geom * loss_geom
+                          + args.lambda_smooth * loss_smooth
+                          + args.lambda_spread * loss_spread)
 
                 g_opt.zero_grad()
                 g_loss.backward()
@@ -155,6 +178,7 @@ def train():
                 g_loss_sum += g_loss.item()
                 geom_sum += loss_geom.item()
                 smooth_sum += loss_smooth.item()
+                spread_sum += loss_spread.item()
                 n_g_steps += 1
 
         # ---- 日志 ----
@@ -163,10 +187,11 @@ def train():
             g_avg = g_loss_sum / max(n_g_steps, 1)
             geom_avg = geom_sum / max(n_g_steps, 1)
             smooth_avg = smooth_sum / max(n_g_steps, 1)
+            spread_avg = spread_sum / max(n_g_steps, 1)
             print(
                 f"Epoch {epoch+1}/{args.epochs}  "
                 f"D={d_avg:.4f}  G={g_avg:.4f}  "
-                f"Geom={geom_avg:.4f}  Smooth={smooth_avg:.6f}"
+                f"Geom={geom_avg:.4f}  Smooth={smooth_avg:.6f}  Spread={spread_avg:.4f}"
             )
 
         # ---- 定期保存 ----
