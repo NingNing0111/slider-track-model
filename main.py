@@ -5,13 +5,35 @@
 from pathlib import Path
 import json
 import numpy as np
+import matplotlib
+matplotlib.use("Agg")  # 非交互后端，兼容无 GUI 服务器
 import matplotlib.pyplot as plt
-from matplotlib import rcParams
+from matplotlib import rcParams, font_manager
 
 from inference import load_generator, generate_trajectory
 
-rcParams["font.sans-serif"] = ["SimHei", "Microsoft YaHei", "DejaVu Sans"]
+# 自动检测可用中文字体，找不到则使用英文标签
+_CJK_CANDIDATES = [
+    "SimHei", "Microsoft YaHei",                       # Windows
+    "WenQuanYi Micro Hei", "WenQuanYi Zen Hei",       # Linux 常见
+    "Noto Sans CJK SC", "Noto Sans SC",                # Google Noto
+    "Source Han Sans SC",                               # Adobe 思源
+    "AR PL UMing CN", "AR PL UKai CN",                 # 文鼎
+]
+_USE_CN = False
+for _fname in _CJK_CANDIDATES:
+    if font_manager.findfont(_fname, fallback_to_default=False):
+        rcParams["font.sans-serif"] = [_fname, "DejaVu Sans"]
+        _USE_CN = True
+        break
+if not _USE_CN:
+    rcParams["font.sans-serif"] = ["DejaVu Sans"]
 rcParams["axes.unicode_minus"] = False
+
+
+def _L(cn: str, en: str) -> str:
+    """根据是否有中文字体选择标签。"""
+    return cn if _USE_CN else en
 
 COMPARE_DIR = Path("dataset/compare")
 INDEX_JSON = COMPARE_DIR / "index.json"
@@ -211,7 +233,8 @@ def plot_comparison():
 
     colors = plt.cm.tab10(np.linspace(0, 1, max(n, 1)))
     fig, axes = plt.subplots(2, 4, figsize=(16, 9))
-    fig.suptitle(f"人工轨迹 vs 模型轨迹 对比（共 {n} 条）", fontsize=13)
+    fig.suptitle(_L(f"人工轨迹 vs 模型轨迹 对比（共 {n} 条）",
+                     f"Human vs Model Trajectory Comparison ({n} traces)"), fontsize=13)
 
     def add_curves(ax, plot_fn, x_label=None, y_label=None, title=None):
         for i, p in enumerate(pairs):
@@ -226,51 +249,72 @@ def plot_comparison():
         ax.legend(loc="best", fontsize=8)
         ax.grid(True, alpha=0.3)
 
+    _h = _L("人工", "Human")
+    _m = _L("模型", "Model")
+
     # 1. 位移-时间 X vs T
     def plot_xt(ax, p, i, c):
-        ax.plot(p["t_h"], p["x_h"], "-", color=c, linewidth=2, label=f"#{i+1} 人工")
-        ax.plot(p["t_m"], p["x_m"], "--", color=c, linewidth=1.5, label=f"#{i+1} 模型")
-    add_curves(axes[0, 0], plot_xt, "时间 T (ms)", "位移 X (px)", "位移-时间 (X vs T)")
+        ax.plot(p["t_h"], p["x_h"], "-", color=c, linewidth=2, label=f"#{i+1} {_h}")
+        ax.plot(p["t_m"], p["x_m"], "--", color=c, linewidth=1.5, label=f"#{i+1} {_m}")
+    add_curves(axes[0, 0], plot_xt,
+               _L("时间 T (ms)", "Time T (ms)"),
+               _L("位移 X (px)", "Displacement X (px)"),
+               _L("位移-时间 (X vs T)", "Displacement vs Time"))
 
     # 2. 速度-时间
     def plot_vt(ax, p, i, c):
-        ax.plot(p["t_h_mid"], p["v_h"], "-", color=c, linewidth=2, label=f"#{i+1} 人工")
-        ax.plot(p["t_m_mid"], p["v_m"], "--", color=c, linewidth=1.5, label=f"#{i+1} 模型")
-    add_curves(axes[0, 1], plot_vt, "时间 T (ms)", "速度 (px/ms)", "速度-时间 (Velocity vs Time)")
+        ax.plot(p["t_h_mid"], p["v_h"], "-", color=c, linewidth=2, label=f"#{i+1} {_h}")
+        ax.plot(p["t_m_mid"], p["v_m"], "--", color=c, linewidth=1.5, label=f"#{i+1} {_m}")
+    add_curves(axes[0, 1], plot_vt,
+               _L("时间 T (ms)", "Time T (ms)"),
+               _L("速度 (px/ms)", "Velocity (px/ms)"),
+               _L("速度-时间", "Velocity vs Time"))
 
     # 3. 加速度-时间
     def plot_at(ax, p, i, c):
-        ax.plot(p["t_h_a"], p["a_h"], "-", color=c, linewidth=2, label=f"#{i+1} 人工")
-        ax.plot(p["t_m_a"], p["a_m"], "--", color=c, linewidth=1.5, label=f"#{i+1} 模型")
-    add_curves(axes[0, 2], plot_at, "时间 T (ms)", "加速度", "加速度-时间 (Acceleration vs Time)")
+        ax.plot(p["t_h_a"], p["a_h"], "-", color=c, linewidth=2, label=f"#{i+1} {_h}")
+        ax.plot(p["t_m_a"], p["a_m"], "--", color=c, linewidth=1.5, label=f"#{i+1} {_m}")
+    add_curves(axes[0, 2], plot_at,
+               _L("时间 T (ms)", "Time T (ms)"),
+               _L("加速度", "Acceleration"),
+               _L("加速度-时间", "Acceleration vs Time"))
 
     # 4. 归一化形态
     def plot_norm(ax, p, i, c):
-        ax.plot(p["t_h_norm"], p["x_h_norm"], "-", color=c, linewidth=2, label=f"#{i+1} 人工")
-        ax.plot(p["t_m_norm"], p["x_m_norm"], "--", color=c, linewidth=1.5, label=f"#{i+1} 模型")
-    add_curves(axes[0, 3], plot_norm, "归一化时间 (0~1)", "归一化位移 (0~1)", "形态对比：位移/时间 归一化")
+        ax.plot(p["t_h_norm"], p["x_h_norm"], "-", color=c, linewidth=2, label=f"#{i+1} {_h}")
+        ax.plot(p["t_m_norm"], p["x_m_norm"], "--", color=c, linewidth=1.5, label=f"#{i+1} {_m}")
+    add_curves(axes[0, 3], plot_norm,
+               _L("归一化时间 (0~1)", "Norm. Time (0~1)"),
+               _L("归一化位移 (0~1)", "Norm. Disp. (0~1)"),
+               _L("形态对比：归一化", "Shape: Normalized"))
 
     # 5. 平均速度 vs 轨迹长度
     def plot_avgv(ax, p, i, c):
-        ax.plot(p["s_h"], p["v_avg_h"], "-", color=c, linewidth=2, label=f"#{i+1} 人工")
-        ax.plot(p["s_m"], p["v_avg_m"], "--", color=c, linewidth=1.5, label=f"#{i+1} 模型")
-    add_curves(axes[1, 0], plot_avgv, "轨迹长度 / 距离 (px)", "平均速度 (px/ms)", "平均速度 vs 轨迹长度")
+        ax.plot(p["s_h"], p["v_avg_h"], "-", color=c, linewidth=2, label=f"#{i+1} {_h}")
+        ax.plot(p["s_m"], p["v_avg_m"], "--", color=c, linewidth=1.5, label=f"#{i+1} {_m}")
+    add_curves(axes[1, 0], plot_avgv,
+               _L("轨迹长度 (px)", "Path Length (px)"),
+               _L("平均速度 (px/ms)", "Avg Speed (px/ms)"),
+               _L("平均速度 vs 轨迹长度", "Avg Speed vs Path Length"))
 
     # 6. 抖动
     def plot_jitter(ax, p, i, c):
-        ax.plot(p["t_j_h"], p["jitter_h"], "-", color=c, linewidth=2, label=f"#{i+1} 人工")
-        ax.plot(p["t_j_m"], p["jitter_m"], "--", color=c, linewidth=1.5, label=f"#{i+1} 模型")
-    add_curves(axes[1, 1], plot_jitter, "时间 T (ms)", "抖动 (位移方差)", "抖动/方差 (Jitter vs Time)")
+        ax.plot(p["t_j_h"], p["jitter_h"], "-", color=c, linewidth=2, label=f"#{i+1} {_h}")
+        ax.plot(p["t_j_m"], p["jitter_m"], "--", color=c, linewidth=1.5, label=f"#{i+1} {_m}")
+    add_curves(axes[1, 1], plot_jitter,
+               _L("时间 T (ms)", "Time T (ms)"),
+               _L("抖动 (位移方差)", "Jitter (disp. var.)"),
+               _L("抖动/方差", "Jitter vs Time"))
 
     # 7. 加速度分布直方图（多条叠加）
     ax = axes[1, 2]
     for i, p in enumerate(pairs):
         c = colors[i % len(colors)]
-        ax.hist(p["a_h"], bins=20, alpha=0.4, label=f"#{i+1} 人工", color=c, density=True, histtype="step", linewidth=2)
-        ax.hist(p["a_m"], bins=20, alpha=0.4, label=f"#{i+1} 模型", color=c, density=True, histtype="step", linestyle="--")
-    ax.set_xlabel("加速度")
-    ax.set_ylabel("密度")
-    ax.set_title("加速度分布 (Acceleration Distribution)")
+        ax.hist(p["a_h"], bins=20, alpha=0.4, label=f"#{i+1} {_h}", color=c, density=True, histtype="step", linewidth=2)
+        ax.hist(p["a_m"], bins=20, alpha=0.4, label=f"#{i+1} {_m}", color=c, density=True, histtype="step", linestyle="--")
+    ax.set_xlabel(_L("加速度", "Acceleration"))
+    ax.set_ylabel(_L("密度", "Density"))
+    ax.set_title(_L("加速度分布", "Acceleration Distribution"))
     ax.legend(loc="best", fontsize=8)
     ax.grid(True, alpha=0.3)
 
@@ -280,7 +324,7 @@ def plot_comparison():
     out = Path("dataset/compare/comparison.png")
     out.parent.mkdir(parents=True, exist_ok=True)
     plt.savefig(out, dpi=150, bbox_inches="tight")
-    plt.show()
+    plt.close(fig)
     print(f"对比图已保存: {out}（共 {n} 条轨迹）")
 
 
