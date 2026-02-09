@@ -8,3 +8,7 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Exported artifacts
+checkpoints/*.onnx
+example/out_*.json

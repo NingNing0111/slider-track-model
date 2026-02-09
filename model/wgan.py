@@ -31,6 +31,8 @@ class Generator(nn.Module):
             nn.LeakyReLU(0.2),
         )
         self.pos_embedding = nn.Embedding(max_len, hidden)
+        # ONNX 友好：位置索引作为常量 buffer，避免 forward 内创建 arange
+        self.register_buffer("pos_idx", torch.arange(max_len, dtype=torch.long), persistent=False)
         self.step_noise_proj = nn.Linear(self.step_noise_dim, hidden) if self.step_noise_dim > 0 else None
         self.lstm = nn.LSTM(hidden, hidden, num_layers=2, batch_first=True)
         self.out = nn.Sequential(
@@ -39,17 +41,23 @@ class Generator(nn.Module):
             nn.Linear(64, FEAT),
         )
 
-    def forward(self, z, c):
+    def forward(self, z, c, step_noise=None):
         batch_size = z.size(0)
         h = self.proj(torch.cat([z, c], dim=1))                            # (B, H)
         h = h.unsqueeze(1).expand(-1, self.max_len, -1)                    # (B, L, H)
-        pos_idx = torch.arange(self.max_len, device=z.device).unsqueeze(0).expand(batch_size, -1)
-        pos_emb = self.pos_embedding(pos_idx)                              # (B, L, H)
+        pos_emb = self.pos_embedding(self.pos_idx.unsqueeze(0).expand(batch_size, -1))  # (B, L, H)
         lstm_in = h + pos_emb
         # 逐步噪声：让生成器在局部也有随机性，避免只输出过于平滑的“均值轨迹”
         if self.step_noise_proj is not None and self.step_noise_alpha > 0:
-            eps = torch.randn(batch_size, self.max_len, self.step_noise_dim, device=z.device, dtype=z.dtype)
-            lstm_in = lstm_in + self.step_noise_alpha * self.step_noise_proj(eps)
+            if step_noise is None:
+                step_noise = torch.randn(
+                    batch_size,
+                    self.max_len,
+                    self.step_noise_dim,
+                    device=z.device,
+                    dtype=z.dtype,
+                )
+            lstm_in = lstm_in + self.step_noise_alpha * self.step_noise_proj(step_noise)
         out, _ = self.lstm(lstm_in)
         return self.out(out)                                               # (B, L, 2)
 
