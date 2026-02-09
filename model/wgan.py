@@ -11,9 +11,19 @@ FEAT = 2             # dx, dy（去掉 dt，用固定时间间隔）
 class Generator(nn.Module):
     """输入: z (batch, latent_dim), c (batch, 1); 输出: (batch, max_len, 2)."""
 
-    def __init__(self, latent_dim=LATENT_DIM, cond_dim=COND_DIM, max_len=MAX_LEN, hidden=128):
+    def __init__(
+        self,
+        latent_dim=LATENT_DIM,
+        cond_dim=COND_DIM,
+        max_len=MAX_LEN,
+        hidden=128,
+        step_noise_dim=16,
+        step_noise_alpha=1.0,
+    ):
         super().__init__()
         self.max_len = max_len
+        self.step_noise_dim = int(step_noise_dim)
+        self.step_noise_alpha = float(step_noise_alpha)
         self.proj = nn.Sequential(
             nn.Linear(latent_dim + cond_dim, hidden),
             nn.LeakyReLU(0.2),
@@ -21,6 +31,7 @@ class Generator(nn.Module):
             nn.LeakyReLU(0.2),
         )
         self.pos_embedding = nn.Embedding(max_len, hidden)
+        self.step_noise_proj = nn.Linear(self.step_noise_dim, hidden) if self.step_noise_dim > 0 else None
         self.lstm = nn.LSTM(hidden, hidden, num_layers=2, batch_first=True)
         self.out = nn.Sequential(
             nn.Linear(hidden, 64),
@@ -35,6 +46,10 @@ class Generator(nn.Module):
         pos_idx = torch.arange(self.max_len, device=z.device).unsqueeze(0).expand(batch_size, -1)
         pos_emb = self.pos_embedding(pos_idx)                              # (B, L, H)
         lstm_in = h + pos_emb
+        # 逐步噪声：让生成器在局部也有随机性，避免只输出过于平滑的“均值轨迹”
+        if self.step_noise_proj is not None and self.step_noise_alpha > 0:
+            eps = torch.randn(batch_size, self.max_len, self.step_noise_dim, device=z.device, dtype=z.dtype)
+            lstm_in = lstm_in + self.step_noise_alpha * self.step_noise_proj(eps)
         out, _ = self.lstm(lstm_in)
         return self.out(out)                                               # (B, L, 2)
 
@@ -46,11 +61,13 @@ class Discriminator(nn.Module):
         super().__init__()
         layers = []
         in_c = FEAT + cond_dim   # dx, dy + condition
-        for ch in channels:
+        for i, ch in enumerate(channels):
+            # 第一层不下采样，更敏感高频/局部细节；后续再做 stride=2 下采样
+            stride = 1 if i == 0 else 2
             layers += [
                 nn.Conv1d(in_c, ch, 5, padding=2),
                 nn.LeakyReLU(0.2),
-                nn.Conv1d(ch, ch, 3, stride=2, padding=1),
+                nn.Conv1d(ch, ch, 3, stride=stride, padding=1),
                 nn.LeakyReLU(0.2),
             ]
             in_c = ch

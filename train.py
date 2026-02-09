@@ -20,7 +20,7 @@ LATENT_DIM = 64
 LAMBDA_GP = 10.0        # WGAN-GP 梯度惩罚
 LAMBDA_GEOM = 5.0       # 几何约束（终点距离）
 # 重要：该项会显著“变平滑”。如果你觉得生成轨迹过于光滑，把它降到 0~0.2，甚至置 0。
-LAMBDA_SMOOTH = 0.2     # 平滑约束（惩罚 jerk，默认降低）
+LAMBDA_SMOOTH = 0.0     # 平滑约束（惩罚 jerk）；想要更多细节时建议默认关闭
 D_STEPS = 5             # 判别器每训练 D_STEPS 次，生成器训练 1 次
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
