@@ -17,8 +17,8 @@ class Generator(nn.Module):
         cond_dim=COND_DIM,
         max_len=MAX_LEN,
         hidden=128,
-        step_noise_dim=16,
-        step_noise_alpha=0.2,
+        step_noise_dim=32,
+        step_noise_alpha=0.4,
     ):
         super().__init__()
         self.max_len = max_len

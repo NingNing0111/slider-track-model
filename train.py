@@ -22,6 +22,9 @@ LAMBDA_GEOM = 2.0       # 几何约束（终点距离），降低避免主导
 LAMBDA_SMOOTH = 2.0     # 平滑约束（惩罚 jerk），过大会压制抖动
 LAMBDA_SPREAD = 3.0     # 分散约束：防止位移集中在少数步
 LAMBDA_JITTER = 0.2     # 最小抖动约束：鼓励 dx 有人手般的自然波动（过大会引入过强波动）
+LAMBDA_ACC = 1.0        # 加速度强度约束：鼓励速度有阶跃变化，避免加速度接近 0
+MIN_ACC_STD = 0.03      # 归一化空间中「速度差分」的最小标准差（对应加速度有起伏）
+JITTER_WINDOW = 8       # 0=仅全局抖动；8 等=按窗口约束局部抖动，更易产生加速度起伏
 LAMBDA_DRAWDOWN = 2.0   # 回撤约束：惩罚 x(t) 从历史高点的大幅回撤
 DRAWDOWN_MARGIN_PX = 2.0  # 允许的微小回撤（px），超过部分才惩罚
 D_STEPS = 3             # D/G 训练比（减少以获得更多 G 更新）
@@ -87,16 +90,33 @@ def spread_loss(fake_seq):
     return concentration + backward
 
 
-def jitter_loss(fake_seq, min_std=0.04):
+def jitter_loss(fake_seq, min_std=0.06, window=0):
     """
     最小抖动约束：鼓励 dx 沿时间有自然波动，避免过于平滑。
-    人工轨迹的 dx 有明显方差（手部微抖），模型不应输出完美平滑序列。
-    fake_seq: (B, L, 2)
-    min_std: 归一化空间中 dx 的最小标准差
+    window=0：整段轨迹的 dx 标准差不低于 min_std。
+    window>0：按时间窗口计算局部标准差，鼓励各段都有抖动（更易产生加速度起伏）。
     """
-    dx = fake_seq[:, :, 0]                                      # (B, L)
-    std_per_sample = dx.std(dim=1).clamp(min=1e-8)              # (B,)
-    return (min_std - std_per_sample).clamp(min=0).mean()
+    dx = fake_seq[:, :, 0]  # (B, L)
+    B, L = dx.shape
+    if window is None or window <= 0 or L < window:
+        std_per_sample = dx.std(dim=1).clamp(min=1e-8)
+        return (min_std - std_per_sample).clamp(min=0).mean()
+    patches = dx.unfold(dimension=1, size=window, step=1)  # (B, L-win+1, window)
+    std_local = patches.std(dim=-1).clamp(min=1e-8)  # (B, L-win+1)
+    return (min_std - std_local).clamp(min=0).mean()
+
+
+def acceleration_strength_loss(fake_seq, min_acc_std=0.03):
+    """
+    加速度强度约束：鼓励「速度差分」(dx 的步间差) 有足够方差，
+    使轨迹在时间上有加速/减速起伏，而不是近乎匀速（加速度接近 0）。
+    fake_seq: (B, L, 2) 即 (dx, dy) 序列；速度 ≈ dx，加速度 ≈ dx 的一阶差分。
+    """
+    vel = fake_seq[:, :, 0]  # (B, L) dx
+    acc = vel[:, 1:] - vel[:, :-1]  # (B, L-1) 步间加速度
+    acc_flat = acc.reshape(acc.size(0), -1)
+    acc_std = acc_flat.std(dim=1).clamp(min=1e-8)
+    return (min_acc_std - acc_std).clamp(min=0).mean()
 
 
 def drawdown_loss(fake_seq, margin_px: float = DRAWDOWN_MARGIN_PX):
@@ -134,6 +154,9 @@ def train():
     parser.add_argument("--lambda-smooth", type=float, default=LAMBDA_SMOOTH)
     parser.add_argument("--lambda-spread", type=float, default=LAMBDA_SPREAD)
     parser.add_argument("--lambda-jitter", type=float, default=LAMBDA_JITTER)
+    parser.add_argument("--lambda-acc", type=float, default=LAMBDA_ACC, help="加速度强度约束权重")
+    parser.add_argument("--min-acc-std", type=float, default=MIN_ACC_STD, help="速度差分的最小标准差")
+    parser.add_argument("--jitter-window", type=int, default=JITTER_WINDOW, help="0=全局抖动; 8 等=局部窗口抖动")
     parser.add_argument("--lambda-drawdown", type=float, default=LAMBDA_DRAWDOWN)
     parser.add_argument("--drawdown-margin-px", type=float, default=DRAWDOWN_MARGIN_PX)
     args = parser.parse_args()
@@ -151,8 +174,9 @@ def train():
     print(f"序列长度: {SEQ_LEN}, 特征维度: 2 (dx, dy), 设备: {DEVICE}")
     print(f"超参: epochs={args.epochs}, batch_size={args.batch_size}, lr={args.lr}, d_steps={args.d_steps}")
     print(
-        f"  λ_gp={args.lambda_gp}, λ_geom={args.lambda_geom}, "
-        f"λ_smooth={args.lambda_smooth}, λ_spread={args.lambda_spread}, λ_jitter={args.lambda_jitter}, "
+        f"  λ_gp={args.lambda_gp}, λ_geom={args.lambda_geom}, λ_smooth={args.lambda_smooth}, "
+        f"λ_spread={args.lambda_spread}, λ_jitter={args.lambda_jitter}, λ_acc={args.lambda_acc} "
+        f"(min_acc_std={args.min_acc_std}, jitter_win={args.jitter_window}), "
         f"λ_drawdown={args.lambda_drawdown} (margin={args.drawdown_margin_px}px)"
     )
 
@@ -169,7 +193,7 @@ def train():
         G.train()
         D.train()
         d_loss_sum, g_loss_sum = 0.0, 0.0
-        geom_sum, smooth_sum, spread_sum, jitter_sum, dd_sum = 0.0, 0.0, 0.0, 0.0, 0.0
+        geom_sum, smooth_sum, spread_sum, jitter_sum, acc_sum, dd_sum = 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
         n_d_steps, n_g_steps = 0, 0
 
         for step, (cond_np, seq_np) in enumerate(
@@ -203,7 +227,10 @@ def train():
                 loss_geom = geometry_loss(gen_seq, cond)
                 loss_smooth = smoothness_loss(gen_seq)
                 loss_spread = spread_loss(gen_seq)
-                loss_jitter = jitter_loss(gen_seq)
+                loss_jitter = jitter_loss(
+                    gen_seq, min_std=0.06, window=args.jitter_window if args.jitter_window > 0 else None
+                )
+                loss_acc = acceleration_strength_loss(gen_seq, min_acc_std=args.min_acc_std)
                 loss_dd = drawdown_loss(gen_seq, margin_px=args.drawdown_margin_px)
 
                 g_loss = (loss_adv
@@ -211,6 +238,7 @@ def train():
                           + args.lambda_smooth * loss_smooth
                           + args.lambda_spread * loss_spread
                           + args.lambda_jitter * loss_jitter
+                          + args.lambda_acc * loss_acc
                           + args.lambda_drawdown * loss_dd)
 
                 g_opt.zero_grad()
@@ -222,6 +250,7 @@ def train():
                 smooth_sum += loss_smooth.item()
                 spread_sum += loss_spread.item()
                 jitter_sum += loss_jitter.item()
+                acc_sum += loss_acc.item()
                 dd_sum += loss_dd.item()
                 n_g_steps += 1
 
@@ -234,11 +263,12 @@ def train():
             spread_avg = spread_sum / max(n_g_steps, 1)
             jitter_avg = jitter_sum / max(n_g_steps, 1)
             dd_avg = dd_sum / max(n_g_steps, 1)
+            acc_avg = acc_sum / max(n_g_steps, 1)
             print(
                 f"Epoch {epoch+1}/{args.epochs}  "
                 f"D={d_avg:.4f}  G={g_avg:.4f}  "
                 f"Geom={geom_avg:.4f}  Smooth={smooth_avg:.6f}  "
-                f"Spread={spread_avg:.4f}  Jitter={jitter_avg:.4f}  Drawdown={dd_avg:.6f}"
+                f"Spread={spread_avg:.4f}  Jitter={jitter_avg:.4f}  Acc={acc_avg:.4f}  Drawdown={dd_avg:.6f}"
             )
 
         # ---- 定期保存 ----

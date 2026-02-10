@@ -12,3 +12,5 @@ wheels/
 # Exported artifacts
 checkpoints/*.onnx
 example/out_*.json
+example/browser_user_data
+example/slider-example.py
