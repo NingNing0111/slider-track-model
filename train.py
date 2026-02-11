@@ -134,6 +134,7 @@ def train():
     parser.add_argument("--lambda-jitter", type=float, default=LAMBDA_JITTER)
     parser.add_argument("--lambda-acc", type=float, default=LAMBDA_ACC)
     parser.add_argument("--jitter-window", type=int, default=JITTER_WINDOW)
+    parser.add_argument("--min-acc-std", type=float, default=MIN_ACC_STD)
     parser.add_argument("--lambda-drawdown", type=float, default=LAMBDA_DRAWDOWN)
     parser.add_argument("--drawdown-margin-px", type=float, default=DRAWDOWN_MARGIN_PX)
     args = parser.parse_args()
