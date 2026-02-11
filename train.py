@@ -48,7 +48,7 @@ def gradient_penalty(D, real, fake, cond):
     return ((grad.norm(2, dim=1) - 1) ** 2).mean()
 
 # ============================
-# 优化后的轨迹 Loss 类
+# 优化后的轨迹 Loss 类 (集成 FFT 频域约束)
 # ============================
 class OptimizedTrajectoryLoss:
     def __init__(self, norm_scale, d_max):
@@ -69,16 +69,16 @@ class OptimizedTrajectoryLoss:
         accel = torch.diff(vel, dim=1)
         jerk = torch.diff(accel, dim=1)
 
-        # 1. 几何与对齐：X轴到终点，Y轴回原点
+        # 1. 几何与对齐
         target_val = cond.squeeze(1) * (self.d_max / self.norm_scale)
         loss_geom_x = F.mse_loss(x_cum[:, -1], target_val)
         loss_geom_y = torch.mean(y_cum[:, -1]**2)
         
-        # 2. 物理平滑度：惩罚三阶导(jerk)和Y轴剧烈加速度
+        # 2. 物理平滑度
         loss_smooth = torch.mean(jerk**2)
         loss_accel_y = torch.mean(accel[:, :, 1]**2)
 
-        # 3. Y轴边界：限制上下漂移范围
+        # 3. Y轴边界
         y_range = torch.max(y_cum, dim=1).values - torch.min(y_cum, dim=1).values
         margin_y = 5.0 / self.norm_scale
         loss_y_range = torch.mean(F.relu(y_range - margin_y)**2)
@@ -89,24 +89,36 @@ class OptimizedTrajectoryLoss:
         margin_dd = args.drawdown_margin_px / self.norm_scale
         loss_drawdown = torch.mean(F.relu(dd - margin_dd)**2)
 
-        # 5. 分散度损失：单步最大占比不宜过高
+        # 5. 分散度损失
         max_step_ratio = (dx.abs() / (dx.abs().sum(dim=1, keepdim=True) + 1e-6)).max(dim=1)[0]
         loss_spread = torch.mean(F.relu(max_step_ratio - 0.15))
 
-        # 6. 终点稳定性：最后10%步长模拟减速对准
-        end_vel = vel[:, -int(SEQ_LEN*0.1):, :]
+        # 6. 终点稳定性
+        end_vel = vel[:, -int(fake_seq.size(1)*0.1):, :]
         loss_stop = torch.mean(end_vel**2)
 
-        # 7. 抖动约束：与可视化一致，用 ds=sqrt(dx^2+dy^2) 的滑动窗口方差
-        #    人类轨迹 jitter (disp. var.) 约 100~250（像素²），归一化约 0.5~2.5
+        # 7. 抖动约束：时域方差 (Jitter)
         ds = torch.sqrt(dx**2 + dy**2 + 1e-12)
         if ds.size(1) >= args.jitter_window:
             var_local = ds.unfold(1, args.jitter_window, 1).var(dim=-1)
             target_var = getattr(args, "jitter_target_var", 0.5)
-            loss_jitter = (target_var - var_local).clamp(min=0).mean()
+            # 允许抖动在一定范围内波动，而不是死板地等于 target_var
+            loss_jitter = F.mse_loss(var_local.mean(), torch.tensor(target_var, device=dx.device))
         else:
             loss_jitter = torch.tensor(0.0, device=dx.device)
 
+        # 8. 新增：频域能量约束 (频谱特征)
+        # 通过 FFT 确保在人类震颤频率区间（模拟 8-12Hz 映射到序列索引）有足够能量
+        # 防止 GAN 生成过于丝滑（低频占绝对主导）的轨迹
+        fft_dx = torch.fft.rfft(dx, dim=1)
+        mag_dx = torch.abs(fft_dx)
+        # 假设 5-15 索引范围对应人类微颤的高频成分
+        high_freq_energy = mag_dx[:, 5:20].mean()
+        low_freq_energy = mag_dx[:, :5].mean()
+        # 惩罚高频能量过低（太滑）的情况
+        loss_spectrum = F.relu(0.1 - (high_freq_energy / (low_freq_energy + 1e-6)))
+
+        # 组合总损失
         total_aux_loss = (
             args.lambda_geom * (loss_geom_x + 0.5 * loss_geom_y) +
             args.lambda_smooth * loss_smooth +
@@ -114,6 +126,7 @@ class OptimizedTrajectoryLoss:
             args.lambda_drawdown * loss_drawdown +
             args.lambda_spread * loss_spread +
             args.lambda_jitter * loss_jitter +
+            2.0 * loss_spectrum +  # 给频谱约束分配固定权重
             1.0 * loss_y_range + 
             2.0 * loss_stop
         )
@@ -123,10 +136,9 @@ class OptimizedTrajectoryLoss:
             "smooth": loss_smooth.item(),
             "dd": loss_drawdown.item(),
             "stop": loss_stop.item(),
-            "jitter": loss_jitter.item()
+            "jitter": loss_jitter.item(),
+            "spectrum": loss_spectrum.item() # 添加到监控中
         }
-
-
 def _plot_training_curves(history, out_dir):
     """绘制训练过程中的 D/G 损失与辅助损失曲线，保存到 out_dir/training_curves.png。"""
     epochs = range(1, len(history["d_loss"]) + 1)
