@@ -121,12 +121,12 @@ class OptimizedTrajectoryLoss:
         # 组合总损失
         total_aux_loss = (
             args.lambda_geom * (loss_geom_x + 0.5 * loss_geom_y) +
-            args.lambda_smooth * loss_smooth +
-            args.lambda_acc * loss_accel_y +
+            args.lambda_smooth * loss_smooth +        # 现在可以通过命令行控制为 0.1
+            args.lambda_acc * loss_accel_y +          # 现在可以通过命令行控制为 0.2
             args.lambda_drawdown * loss_drawdown +
             args.lambda_spread * loss_spread +
             args.lambda_jitter * loss_jitter +
-            2.0 * loss_spectrum +  # 给频谱约束分配固定权重
+            args.lambda_spectrum * loss_spectrum +    # 使用新注册的参数
             1.0 * loss_y_range + 
             2.0 * loss_stop
         )
@@ -193,6 +193,8 @@ def train():
     parser.add_argument("--jitter-window", type=int, default=JITTER_WINDOW)
     parser.add_argument("--jitter-target-var", type=float, default=0.5,
                         help="目标滑动方差（归一化空间），约 0.5 对应像素²约 50")
+                        # 在 train() 函数的参数定义部分补充
+    parser.add_argument("--lambda-spectrum", type=float, default=2.0, help="频域能量约束权重")
     parser.add_argument("--min-acc-std", type=float, default=MIN_ACC_STD)
     parser.add_argument("--lambda-drawdown", type=float, default=LAMBDA_DRAWDOWN)
     parser.add_argument("--drawdown-margin-px", type=float, default=DRAWDOWN_MARGIN_PX)
