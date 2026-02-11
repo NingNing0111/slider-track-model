@@ -145,3 +145,9 @@ uv run python main.py
 *   平均速度 vs 轨迹长度 (Avg Speed vs Distance)
 *   抖动/方差 (Jitter vs Time)
 *   加速度分布 (Acceleration Distribution)
+
+#### 4. 人工行为校验（可选）
+```bash
+uv run python validate.py
+```
+会从 `dataset/train` 统计人工轨迹的核心指标（总时长、速度、加速度、抖动、Y 范围、回撤等），生成 `dataset/compare/human_stats.json`。若存在 `dataset/compare/model.json`，会对模型轨迹做一次通过/不通过判定。也可在代码中调用 `validate.compute_trajectory_metrics(points)` 与 `validate.check_trajectory_pass(points, human_stats)` 做推理后自检。
