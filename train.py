@@ -93,9 +93,15 @@ class OptimizedTrajectoryLoss:
         end_vel = vel[:, -int(SEQ_LEN*0.1):, :]
         loss_stop = torch.mean(end_vel**2)
 
-        # 7. 抖动约束（可选保留）
-        std_local = dx.unfold(1, args.jitter_window, 1).std(dim=-1).clamp(min=1e-8)
-        loss_jitter = (0.06 - std_local).clamp(min=0).mean()
+        # 7. 抖动约束：与可视化一致，用 ds=sqrt(dx^2+dy^2) 的滑动窗口方差
+        #    人类轨迹 jitter (disp. var.) 约 100~250（像素²），归一化约 0.5~2.5
+        ds = torch.sqrt(dx**2 + dy**2 + 1e-12)
+        if ds.size(1) >= args.jitter_window:
+            var_local = ds.unfold(1, args.jitter_window, 1).var(dim=-1)
+            target_var = getattr(args, "jitter_target_var", 0.5)
+            loss_jitter = (target_var - var_local).clamp(min=0).mean()
+        else:
+            loss_jitter = torch.tensor(0.0, device=dx.device)
 
         total_aux_loss = (
             args.lambda_geom * (loss_geom_x + 0.5 * loss_geom_y) +
@@ -134,6 +140,8 @@ def train():
     parser.add_argument("--lambda-jitter", type=float, default=LAMBDA_JITTER)
     parser.add_argument("--lambda-acc", type=float, default=LAMBDA_ACC)
     parser.add_argument("--jitter-window", type=int, default=JITTER_WINDOW)
+    parser.add_argument("--jitter-target-var", type=float, default=0.5,
+                        help="目标滑动方差（归一化空间），约 0.5 对应像素²约 50")
     parser.add_argument("--min-acc-std", type=float, default=MIN_ACC_STD)
     parser.add_argument("--lambda-drawdown", type=float, default=LAMBDA_DRAWDOWN)
     parser.add_argument("--drawdown-margin-px", type=float, default=DRAWDOWN_MARGIN_PX)

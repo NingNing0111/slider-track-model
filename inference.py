@@ -54,7 +54,7 @@ def generate_trajectory(
     target_distance,
     seed=None,
     add_jitter=True,
-    jitter_std_px=0.8,
+    jitter_std_px=2.0,
     jitter_alpha=0.85,
     clip_dx_min_px=-2.0,
     clip_dx_max_px=None,
@@ -83,11 +83,6 @@ def generate_trajectory(
     dx = seq[:, 0] * NORM_SCALE
     dy = seq[:, 1] * NORM_SCALE
 
-    # 可选：加相关噪声模拟手抖
-    if add_jitter and jitter_std_px > 0:
-        dx = dx + _colored_noise(len(dx), std=jitter_std_px, alpha=jitter_alpha)
-        dy = dy + _colored_noise(len(dy), std=jitter_std_px * 0.5, alpha=jitter_alpha)
-
     # ---- 约束：限制每步回退与尖峰（在终点缩放前做，避免缩放放大回撤）----
     if clip_dx_min_px is not None:
         dx = np.maximum(dx, float(clip_dx_min_px))
@@ -107,6 +102,20 @@ def generate_trajectory(
 
     x = np.cumsum(np.concatenate([[0], dx]))
     y = np.cumsum(np.concatenate([[0], dy]))
+
+    # 在缩放后再加手抖噪声，使 Jitter vs Time 更接近人类（滑动窗口内 ds 方差更大）
+    if add_jitter and jitter_std_px > 0:
+        dx = dx + _colored_noise(len(dx), std=jitter_std_px, alpha=jitter_alpha)
+        dy = dy + _colored_noise(len(dy), std=jitter_std_px * 0.5, alpha=jitter_alpha)
+        x = np.cumsum(np.concatenate([[0], dx]))
+        y = np.cumsum(np.concatenate([[0], dy]))
+        total_x = x[-1]
+        if total_x > 1e-6:
+            scale = float(target_distance) / total_x
+            dx = dx * scale
+            dy = dy * scale
+            x = np.cumsum(np.concatenate([[0], dx]))
+            y = np.cumsum(np.concatenate([[0], dy]))
 
     # 可选：强制单调（彻底消除回撤），再做一次终点对齐
     if force_monotone_x:
