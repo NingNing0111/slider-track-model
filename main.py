@@ -8,32 +8,18 @@ import numpy as np
 import matplotlib
 matplotlib.use("Agg")  # 非交互后端，兼容无 GUI 服务器
 import matplotlib.pyplot as plt
-from matplotlib import rcParams, font_manager
+from matplotlib import rcParams
 
 from inference import load_generator, generate_trajectory
 
-# 自动检测可用中文字体，找不到则使用英文标签
-_CJK_CANDIDATES = [
-    "SimHei", "Microsoft YaHei",                       # Windows
-    "WenQuanYi Micro Hei", "WenQuanYi Zen Hei",       # Linux 常见
-    "Noto Sans CJK SC", "Noto Sans SC",                # Google Noto
-    "Source Han Sans SC",                               # Adobe 思源
-    "AR PL UMing CN", "AR PL UKai CN",                 # 文鼎
-]
-_USE_CN = False
-for _fname in _CJK_CANDIDATES:
-    if font_manager.findfont(_fname, fallback_to_default=False):
-        rcParams["font.sans-serif"] = [_fname, "DejaVu Sans"]
-        _USE_CN = True
-        break
-if not _USE_CN:
-    rcParams["font.sans-serif"] = ["DejaVu Sans"]
+# 图片内统一使用英文标签，避免中文/字体问题
+rcParams["font.sans-serif"] = ["DejaVu Sans"]
 rcParams["axes.unicode_minus"] = False
 
 
-def _L(cn: str, en: str) -> str:
-    """根据是否有中文字体选择标签。"""
-    return cn if _USE_CN else en
+def _L(_cn: str, en: str) -> str:
+    """图表标签统一返回英文。"""
+    return en
 
 COMPARE_DIR = Path("dataset/compare")
 INDEX_JSON = COMPARE_DIR / "index.json"
