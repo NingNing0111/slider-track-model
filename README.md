@@ -1,13 +1,9 @@
 ## 调用
 
-```js
-fetch("https://api-track.pgthinker.me/api/generate", {
-  "headers": {
-    "content-type": "application/json"
-  },
-  "body": "{\"start_x\":50,\"start_y\":100,\"end_x\":350,\"end_y\":100}",
-  "method": "POST",
-});
+```shell
+curl -X POST "https://api-track.pgthinker.me/api/generate" \
+     -H "Content-Type: application/json" \
+     -d '{"start_x":50,"start_y":100,"end_x":350,"end_y":100}'
 ```
 
 ## 项目简介
