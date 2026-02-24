@@ -1,3 +1,15 @@
+## 调用
+
+```js
+fetch("https://api-track.pgthinker.me/api/generate", {
+  "headers": {
+    "content-type": "application/json"
+  },
+  "body": "{\"start_x\":50,\"start_y\":100,\"end_x\":350,\"end_y\":100}",
+  "method": "POST",
+});
+```
+
 ## 项目简介
 
 本仓库实现了一个**生成滑块验证轨迹的条件 WGAN-GP 模型**，目标是在给定目标距离（滑块需要移动的像素距离）时，生成一条在**几何形状、速度曲线、加速度特征、抖动分布**等方面都尽量接近真人操作的轨迹，用于：
